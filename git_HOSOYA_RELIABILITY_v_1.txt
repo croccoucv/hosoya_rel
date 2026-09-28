@@ -1,0 +1,636 @@
+# ==============================================================================
+# Unified Adaptive Network Resilience Engine
+# ------------------------------------------------------------------------------
+set.seed(2026)
+
+
+# Global Hosoya vector d(G', k): count of vertex pairs at each distance k
+get_hosoya_vector <- function(g, max_k) {
+  h_vec <- numeric(max_k)
+  if (ecount(g) == 0) return(h_vec)
+  D <- distances(g)
+  d_vals <- D[upper.tri(D)]
+  d_finite <- d_vals[is.finite(d_vals)]
+  if (length(d_finite) > 0) {
+    tb <- table(d_finite)
+    for (k_str in names(tb)) {
+      k <- as.numeric(k_str)
+      if (k <= max_k) h_vec[k] <- tb[[k_str]]
+    }
+  }
+  h_vec
+}
+
+get_pairwise_st_distance <- function(g, s, t, max_k) {
+  h_pair <- numeric(max_k)
+  if (ecount(g) == 0) return(h_pair)
+  sp <- distances(g, v = s, to = t)[1, 1]
+  if (is.finite(sp)) {
+    k <- as.integer(sp)
+    if (k > 0 && k <= max_k) h_pair[k] <- 1
+  }
+  h_pair
+}
+
+get_m_poly_counts <- function(g, baseline_terms, deg_original) {
+  counts <- numeric(length(baseline_terms))
+  names(counts) <- baseline_terms
+  if (ecount(g) == 0) return(counts)
+
+  edges_mat <- get.edgelist(g, names = FALSE)
+  m_ij <- t(apply(edges_mat, 1, function(e) sort(c(deg_original[e[1]], deg_original[e[2]]))))
+  terms <- paste0("x^", m_ij[, 1], "*y^", m_ij[, 2])
+
+  tb <- table(terms)
+  for (term in names(tb)) {
+    if (term %in% baseline_terms) counts[term] <- tb[[term]]
+  }
+  counts
+}
+
+weighted_mean_sd <- function(mat, w) {
+  mu  <- colSums(mat * w)
+  var <- colSums(w * (sweep(mat, 2, mu, "-"))^2)
+  var[var < 0] <- 0  # guard against floating-point negative near-zero
+  list(mean = mu, sd = sqrt(var))
+}
+
+# ------------------------------------------------------------------------------
+# 3. Unified Adaptive Engine
+# ------------------------------------------------------------------------------
+evaluate_network_resilience_unified <- function(g, s, t,
+                                                  p_vec = c(0.60, 0.80, 0.95),
+                                                  m_max = 12,
+                                                  n_samples = 2000) {
+  n_nodes <- vcount(g)
+  n_edges <- ecount(g)
+  max_k   <- n_nodes - 1
+  total_pairs <- choose(n_nodes, 2)
+
+  deg_original <- degree(g)
+  edges_mat_tmp <- get.edgelist(g, names = FALSE)
+  m_ij_tmp <- t(apply(edges_mat_tmp, 1, function(e) sort(c(deg_original[e[1]], deg_original[e[2]]))))
+  baseline_m_terms <- unique(paste0("x^", m_ij_tmp[, 1], "*y^", m_ij_tmp[, 2]))
+
+  cat("=================================================================\n")
+  cat("        UNIFIED ADAPTIVE RESILIENCE ENGINE (MEAN & SD)          \n")
+  cat("=================================================================\n")
+  cat("Target Terminals  : Source s =", s, "| Target t =", t, "\n")
+  cat("Graph Parameters  :", n_nodes, "Nodes |", n_edges, "Edges |  diam =", max_k, "\n")
+
+  res_list <- list()
+
+  # ============================================================================
+  # BRANCH 1: EXACT BRUTE-FORCE ENUMERATION (|E| <= m_max)
+  # ============================================================================
+  if (n_edges <= m_max) {
+    mode <- "EXACT BRUTE-FORCE"
+    n_states <- 2^n_edges
+    cat("Execution Mode    :", mode, " (2^", n_edges, " = ", n_states,
+        " states <= threshold ", m_max, ")\n\n", sep = "")
+
+    edge_combos <- as.matrix(expand.grid(rep(list(c(0, 1)), n_edges)))
+
+    edges_count_vec <- integer(n_states)
+    hosoya_mat   <- matrix(0, nrow = n_states, ncol = max_k)
+    pairwise_mat <- matrix(0, nrow = n_states, ncol = max_k)
+    reach_vec    <- numeric(n_states)
+    rst_vec      <- numeric(n_states)
+    m_poly_mat   <- matrix(0, nrow = n_states, ncol = length(baseline_m_terms))
+    colnames(m_poly_mat) <- baseline_m_terms
+
+ 
+    enum_t_start <- Sys.time()
+    for (i in 1:n_states) {
+      active_eids <- which(edge_combos[i, ] == 1)
+      edges_count_vec[i] <- length(active_eids)
+      g_sub <- if (length(active_eids) == 0) make_empty_graph(n = n_nodes) else
+        subgraph.edges(g, eids = active_eids, delete.vertices = FALSE)
+
+      h_vec <- get_hosoya_vector(g_sub, max_k)
+      hosoya_mat[i, ] <- h_vec
+      reach_vec[i]    <- sum(h_vec) / total_pairs
+
+      pw_vec <- get_pairwise_st_distance(g_sub, s, t, max_k)
+      pairwise_mat[i, ] <- pw_vec
+      rst_vec[i] <- sum(pw_vec)
+
+      m_poly_mat[i, ] <- get_m_poly_counts(g_sub, baseline_m_terms, deg_original)
+    }
+    enum_t_end <- Sys.time()
+    enumeration_sec <- as.numeric(difftime(enum_t_end, enum_t_start, units = "secs"))
+
+    for (p in p_vec) {
+      # --- TIMING: per-p weighting cost (fast; enumeration above is the dominant cost) ---
+      weight_t_start <- Sys.time()
+
+      w <- (p ^ edges_count_vec) * ((1 - p) ^ (n_edges - edges_count_vec))
+      # w sums to 1 exactly (binomial expansion), used as exact state probabilities
+
+      hosoya_stats   <- weighted_mean_sd(hosoya_mat, w)
+      pairwise_stats <- weighted_mean_sd(pairwise_mat, w)
+      m_poly_stats   <- weighted_mean_sd(m_poly_mat, w)
+
+      reach_mean <- sum(w * reach_vec)
+      reach_sd   <- sqrt(sum(w * (reach_vec - reach_mean)^2))
+      rst_mean   <- sum(w * rst_vec)
+      rst_sd     <- sqrt(sum(w * (rst_vec - rst_mean)^2))
+
+      weight_t_end <- Sys.time()
+      weighting_sec <- as.numeric(difftime(weight_t_end, weight_t_start, units = "secs"))
+
+      res_list[[as.character(p)]] <- list(
+        p = p, Mode = mode,
+        R_st_mean = rst_mean, R_st_sd = rst_sd,
+        Global_Reachability_mean = reach_mean, Global_Reachability_sd = reach_sd,
+        Exp_Hosoya_mean = hosoya_stats$mean, Exp_Hosoya_sd = hosoya_stats$sd,
+        Exp_Pairwise_st_mean = pairwise_stats$mean, Exp_Pairwise_st_sd = pairwise_stats$sd,
+        Exp_M_Poly_mean = m_poly_stats$mean, Exp_M_Poly_sd = m_poly_stats$sd,
+        N = n_states,
+        # NOTE: Enumeration_sec is a ONE-TIME cost shared across all p in this
+        # network (state enumeration does not depend on p). It is repeated
+        # identically in every p entry for schema consistency with the Monte
+        # Carlo branch below -- do NOT sum Enumeration_sec across p when
+        # reporting total network runtime; use it once per network.
+        Enumeration_sec = enumeration_sec,
+        Weighting_sec = weighting_sec,
+        Elapsed_sec = enumeration_sec + weighting_sec
+      )
+    }
+
+    # ==========================================================================
+    # BRANCH 2: MONTE CARLO APPROXIMATION (|E| > m_max)
+    # ==========================================================================
+  } else {
+    mode <- "MONTE CARLO APPROXIMATION"
+    cat("Execution Mode    :", mode, " (edges ", n_edges, " > threshold ", m_max,
+        " | N = ", n_samples, ")\n\n", sep = "")
+
+    for (p in p_vec) {
+      hosoya_samples   <- matrix(0, nrow = n_samples, ncol = max_k)
+      pairwise_samples <- matrix(0, nrow = n_samples, ncol = max_k)
+      m_poly_samples   <- matrix(0, nrow = n_samples, ncol = length(baseline_m_terms))
+      colnames(m_poly_samples) <- baseline_m_terms
+      reach_vec <- numeric(n_samples)
+      rst_vec   <- numeric(n_samples)
+
+      # --- TIMING: wall-clock cost of the full N-sample Monte Carlo pass for this p ---
+      mc_t_start <- Sys.time()
+
+      for (i in 1:n_samples) {
+        active_eids <- which(runif(n_edges) <= p)
+        g_sub <- if (length(active_eids) == 0) make_empty_graph(n = n_nodes) else
+          subgraph.edges(g, eids = active_eids, delete.vertices = FALSE)
+
+        h_vec <- get_hosoya_vector(g_sub, max_k)
+        hosoya_samples[i, ] <- h_vec
+        reach_vec[i] <- sum(h_vec) / total_pairs
+
+        pw_vec <- get_pairwise_st_distance(g_sub, s, t, max_k)
+        pairwise_samples[i, ] <- pw_vec
+        rst_vec[i] <- sum(pw_vec)
+
+        m_poly_samples[i, ] <- get_m_poly_counts(g_sub, baseline_m_terms, deg_original)
+      }
+
+      mc_t_end <- Sys.time()
+      elapsed_sec <- as.numeric(difftime(mc_t_end, mc_t_start, units = "secs"))
+
+      res_list[[as.character(p)]] <- list(
+        p = p, Mode = mode,
+        R_st_mean = mean(rst_vec), R_st_sd = sd(rst_vec),
+        Global_Reachability_mean = mean(reach_vec), Global_Reachability_sd = sd(reach_vec),
+        Exp_Hosoya_mean = colMeans(hosoya_samples), Exp_Hosoya_sd = apply(hosoya_samples, 2, sd),
+        Exp_Pairwise_st_mean = colMeans(pairwise_samples), Exp_Pairwise_st_sd = apply(pairwise_samples, 2, sd),
+        Exp_M_Poly_mean = colMeans(m_poly_samples), Exp_M_Poly_sd = apply(m_poly_samples, 2, sd),
+        N = n_samples,
+        Elapsed_sec = elapsed_sec
+      )
+    }
+  }
+
+  res_list
+}
+
+
+print_detailed_report <- function(res_list, s, t) {
+  # For display only: find the largest k with any non-zero mass across all p,
+  # so we don't print ~30 rows of zeros from the safe n-1 upper bound.
+  max_display_k <- max(sapply(res_list, function(item) {
+    nz <- which(item$Exp_Hosoya_mean > 1e-9)
+    if (length(nz) == 0) 1 else max(nz)
+  }))
+
+  for (p_val in names(res_list)) {
+    item <- res_list[[p_val]]
+    cat(sprintf("\n--- p = %.2f  |  Mode = %s  |  N = %d  |  Elapsed = %.3f sec ---\n",
+                 item$p, item$Mode, item$N, item$Elapsed_sec))
+    cat(sprintf("Global Reachability : Mean = %.4f, SD = %.4f\n",
+                 item$Global_Reachability_mean, item$Global_Reachability_sd))
+    cat(sprintf("R_st (s=%d, t=%d)    : Mean = %.4f, SD = %.4f\n",
+                 s, t, item$R_st_mean, item$R_st_sd))
+
+    cat(sprintf("Global Hosoya E[d_k] (Mean ± SD), k = 1..%d shown (trailing zeros omitted):\n", max_display_k))
+    for (k in 1:max_display_k) {
+      cat(sprintf("  k = %d -> Mean = %8.3f, SD = %7.3f\n",
+                   k, item$Exp_Hosoya_mean[k], item$Exp_Hosoya_sd[k]))
+    }
+
+    cat("Pairwise s-t hop distribution c_k (Mean ± SD), same range:\n")
+    for (k in 1:max_display_k) {
+      cat(sprintf("  k = %d -> Mean = %.4f, SD = %.4f\n",
+                   k, item$Exp_Pairwise_st_mean[k], item$Exp_Pairwise_st_sd[k]))
+    }
+
+    cat("M-Polynomial coefficients m_ij (Mean ± SD), top 10 by mean:\n")
+    ord <- order(-item$Exp_M_Poly_mean)[1:min(10, length(item$Exp_M_Poly_mean))]
+    for (idx in ord) {
+      cat(sprintf("  %-12s -> Mean = %.4f, SD = %.4f\n",
+                   names(item$Exp_M_Poly_mean)[idx],
+                   item$Exp_M_Poly_mean[idx], item$Exp_M_Poly_sd[idx]))
+    }
+  }
+}
+
+format_summary_table <- function(res_list) {
+  df <- data.frame()
+  for (item in res_list) {
+    df <- rbind(df, data.frame(
+      p = item$p,
+      Mode = item$Mode,
+      N = item$N,
+      R_st_mean = round(item$R_st_mean, 4),
+      R_st_sd = round(item$R_st_sd, 4),
+      Reach_mean = round(item$Global_Reachability_mean, 4),
+      Reach_sd = round(item$Global_Reachability_sd, 4),
+      Elapsed_sec = round(item$Elapsed_sec, 4)
+    ))
+  }
+  df
+}
+
+project_se <- function(sd_at_N_old, N_old, N_new) {
+  se_old <- sd_at_N_old / sqrt(N_old)
+  se_new <- sd_at_N_old / sqrt(N_new)
+  data.frame(N_old = N_old, N_new = N_new, SE_old = se_old, SE_new = se_new,
+             ratio = se_new / se_old)
+}
+
+# ------------------------------------------------------------------------------
+# 5. Network plot with highlighted terminals
+# ------------------------------------------------------------------------------
+plot_base_network <- function(g, s, t, netname,title_text = "Base Network Topology") {
+  v_colors <- rep("skyblue2", vcount(g))
+  v_sizes  <- rep(16, vcount(g))
+  v_colors[s] <- "gold"
+  v_colors[t] <- "tomato"
+  v_sizes[s]  <- 24
+  v_sizes[t]  <- 24
+
+  set.seed(2026)
+  layout_coords <- layout_with_fr(g)
+
+windows()
+
+  plot(g, layout = layout_coords, vertex.color = v_colors, vertex.size = v_sizes,
+       vertex.label.color = "black", vertex.label.font = 2,
+       edge.color = "gray60", edge.width = 1.5, main = title_text)
+
+  legend("topleft",
+         legend = c(paste0("Source (s = ", s, ")"), paste0("Target (t = ", t, ")"), "Other Nodes"),
+         col = c("gold", "tomato", "skyblue2"), pch = 19, pt.cex = 1.5, bty = "n")
+
+tiff(filename = paste(netname,".tiff"), width = 6, height = 6, units = "in", res = 600, compression = "lzw")
+  plot(g, layout = layout_coords, vertex.color = v_colors, vertex.size = 4,
+       vertex.label.color = "black",
+       edge.color = "gray60", edge.width = 1.5, main = title_text)
+dev.off()
+}
+
+# ==============================================================================
+# 6. Execution
+# ==============================================================================
+
+g_zachary <- make_graph("Zachary")
+s_node <- 1
+t_node <- 34
+if(1==2){
+plot_base_network(g_zachary, s = s_node, t = t_node,
+                   title_text = "Zachary Karate Club (34 Nodes, 78 Edges)")
+
+results <- evaluate_network_resilience_unified(
+  g_zachary, s = s_node, t = t_node,
+  p_vec = c(0.60, 0.80, 0.95),
+  m_max = 12,        # |E| = 78 > 12 -> triggers Monte Carlo branch on this graph
+  n_samples = 2000
+)
+
+cat("\n=== Summary Table ===\n")
+print(format_summary_table(results))
+
+print_detailed_report(results, s = s_node, t = t_node)
+
+# Example: project the N=2000 SD to a hypothetical larger N, e.g. N=5000
+cat("\n=== SE projection example (global reachability, p = 0.60) ===\n")
+print(project_se(results[["0.6"]]$Global_Reachability_sd, N_old = 2000, N_new = 5000))
+}
+
+# Runs the SAME unified engine (unchanged) across a small suite of networks:
+#   1. Zachary's Karate Club          (existing benchmark, kept for continuity)
+#   2. Erdos-Renyi        G(n, m)     (structural null model / density control)
+#   3. Barabasi-Albert    (scale-free)(hub-dominated, closest to infra degree dist.)
+#   4. Watts-Strogatz     (small-world)(standard model for power/road networks)
+#   5. OPTIONAL: a real/custom topology loaded from an edge-list file
+#      (e.g., an IEEE test feeder). See load_custom_topology() below.
+#
+
+set.seed(2026)
+
+
+# ------------------------------------------------------------------------------
+# 1. Network generators, calibrated to comparable scale where possible
+# ------------------------------------------------------------------------------
+
+build_benchmark_suite <- function(n_target = 34, m_target = 78) {
+  suite <- list()
+
+  # --- 1. Zachary's Karate Club (real, existing benchmark) ---
+  suite[["Zachary"]] <- make_graph("Zachary")
+
+  # --- 2. Erdos-Renyi G(n, m): exact edge-count match to Zachary ---
+  suite[["Erdos-Renyi"]] <- sample_gnm(n = n_target, m = m_target, directed = FALSE)
+
+  # --- 3. Barabasi-Albert (scale-free): m controls edges added per new node.
+  ba_m <- max(1, round(m_target / (n_target - 1)))
+  suite[["Barabasi-Albert"]] <- sample_pa(n = n_target, power = 1, m = ba_m, directed = FALSE)
+
+  # --- 4. Watts-Strogatz (small-world): nei = neighbors on each side in the
+  #        base ring lattice before rewiring; edges ~= n_target * nei.
+  ws_nei <- max(1, round(m_target / n_target))
+  suite[["Watts-Strogatz"]] <- sample_smallworld(dim = 1, size = n_target, nei = ws_nei, p = 0.10)
+
+  suite
+}
+
+# ------------------------------------------------------------------------------
+# 2. OPTIONAL: loader for a real/custom topology from a two-column edge list
+# ------------------------------------------------------------------------------
+# Expected file format: a CSV or whitespace-delimited file with two columns,
+
+load_custom_topology <- function(filepath, header = FALSE, sep = ",") {
+  edges_df <- read.table(filepath, header = header, sep = sep, stringsAsFactors = FALSE)
+  if (ncol(edges_df) < 2) stop("Edge list file must have at least two columns (from, to).")
+  g <- graph_from_data_frame(edges_df[, 1:2], directed = FALSE)
+  g <- simplify(g)  # remove any duplicate edges / self-loops
+  g
+}
+
+#### new
+load_custom_topology <- function(network1) {
+
+ffv<-scan(network1, what=list(0,0,0));
+f1<-ffv[[1]] #Nodo desde
+f2<-ffv[[2]] #Nodo hasta
+f3<-ffv[[3]] #Caracteristica / Peso / etc
+f3=abs(f3) #CR
+lenf3=length(f3)
+#f3=runif(lenf3,rmin,rmax)
+ network=graph(t(cbind(f1,f2)), directed=FALSE)
+#network
+ network=simplify(network)
+g=network
+  g <- simplify(g)  # remove any duplicate edges / self-loops
+  g
+}
+
+
+# --- Illustrative IEEE 14-bus topology (bus numbers as node IDs) -----------
+ieee14_edges <- matrix(c(
+   1, 2,   1, 5,   2, 3,   2, 4,   2, 5,   3, 4,   4, 5,
+   4, 7,   4, 9,   5, 6,   6, 11,  6, 12,  6, 13,  7, 8,
+   7, 9,   9, 10,  9, 14,  10,11,  12,13,  13,14
+), ncol = 2, byrow = TRUE)
+
+build_ieee14_graph <- function() {
+  g <- graph_from_edgelist(ieee14_edges, directed = FALSE)
+  g <- simplify(g)
+  g
+}
+
+# ------------------------------------------------------------------------------
+# 3. Run the unified engine across the full suite
+# ------------------------------------------------------------------------------
+run_benchmark_suite <- function(suite, p_vec = c(0.60, 0.80, 0.95),
+                                 m_max = 12, n_samples = 2000,
+                                 make_plots = TRUE,
+                                 plot_node_limit = 200) {
+  # plot_node_limit: 60 networks larger than this many nodes SKIP the force-
+  all_results <- list()
+
+  for (net_name in names(suite)) {
+    g <- suite[[net_name]]
+
+    if (!is_connected(g)) {
+      cat(sprintf("\n[WARNING] %s is not connected in its intact state; ",
+                   net_name))
+      cat("global reachability and diameter-based bounds should be interpreted accordingly.\n")
+    }
+
+    deg <- degree(g)
+    hub_order <- order(deg, decreasing = TRUE)
+    s_auto <- hub_order[1]
+    t_auto <- hub_order[2]
+
+ 
+    if (make_plots && vcount(g) <= plot_node_limit) {
+      plot_base_network(g, s = s_auto, t = t_auto, netname=net_name,
+                         title_text = paste0(net_name, " (auto-selected hubs s=",
+                                              s_auto, ", t=", t_auto, ")"))
+    } else if (make_plots) {
+      cat(sprintf("[Plot skipped: %s has %d nodes > plot_node_limit = %d]\n",
+                   net_name, vcount(g), plot_node_limit))
+    }
+
+    net_t_start <- Sys.time()
+    res <- evaluate_network_resilience_unified(
+      g, s = s_auto, t = t_auto,
+      p_vec = p_vec, m_max = m_max, n_samples = n_samples
+    )
+    net_t_end <- Sys.time()
+    network_total_sec <- as.numeric(difftime(net_t_end, net_t_start, units = "secs"))
+
+    print_detailed_report(res, s = s_auto, t = t_auto)
+    cat(sprintf("\n[TIMING] %s total elapsed (all p, excl. plotting): %.3f sec\n",
+                 net_name, network_total_sec))
+
+    all_results[[net_name]] <- list(
+      graph_name = net_name,
+      s = s_auto, t = t_auto,
+      n_nodes = vcount(g), n_edges = ecount(g),
+      network_total_sec = network_total_sec,
+      results = res
+    )
+  }
+
+  all_results
+}
+
+# ------------------------------------------------------------------------------
+# 4. Cross-network summary table (for direct import into the paper)
+# ------------------------------------------------------------------------------
+build_cross_network_summary <- function(all_results) {
+  df <- data.frame()
+  for (net in all_results) {
+    for (item in net$results) {
+      df <- rbind(df, data.frame(
+        Network = net$graph_name,
+        N_nodes = net$n_nodes,
+        N_edges = net$n_edges,
+        s = net$s, t = net$t,
+        p = item$p,
+        Mode = item$Mode,
+        R_st_mean = round(item$R_st_mean, 4),
+        R_st_sd = round(item$R_st_sd, 4),
+        Reach_mean = round(item$Global_Reachability_mean, 4),
+        Reach_sd = round(item$Global_Reachability_sd, 4),
+        Elapsed_sec_this_p = round(item$Elapsed_sec, 4),
+        Network_total_sec = round(net$network_total_sec, 4)
+      ))
+    }
+  }
+  df
+}
+
+# ==============================================================================
+# 5. Execution
+# ==============================================================================
+
+# Build the core synthetic suite (Zachary + ER + BA + WS)
+suite <- build_benchmark_suite(n_target = 34, m_target = 78)
+
+# OPTIONAL: illustrative IEEE 14-bus list bundled in this script
+
+
+##### suite[["IEEE-14-Bus"]] <- build_ieee14_graph()
+
+# --- ADD YOUR THREE REAL GRIDS HERE -------------------------------------------
+# suite[["IEEE-118-Bus"]]     <- load_custom_topology("ieee118.txt")
+
+# suite[["Venezuela-Grid"]]   <- load_custom_topology("SENTRONCAL_mod1.txt")
+
+# suite[["Italian-Grid"]]     <- load_custom_topology("it_bas.txt")
+
+#suite[["Spain-Grid"]]     <- load_custom_topology("Spain.txt")
+
+if(1==2){
+g_disconnected <- suite[["Spain-Grid"]]
+ g_disconnected 
+ comp <- components(g_disconnected)
+ 
+ # Identify the index of the largest component
+ largest_id <- which.max(comp$csize)
+ 
+ # Extract the vertices belonging to the largest component
+ largest_cc_1 <- induced_subgraph(g_disconnected, which(comp$membership == largest_id))
+ largest_cc_1
+
+suite[["Spain-Grid"]] <- largest_cc_1
+}
+
+
+
+p_vec = c(0.60, 0.80, 0.95, 0.05,0.20, 0.40,0.50)
+
+all_results <- run_benchmark_suite(suite, p_vec = p_vec,
+                                    m_max = 12, n_samples = 2000,
+                                    make_plots = TRUE, plot_node_limit = 200) #ojo 200 no 60
+
+cat("\n\n=== Cross-Network Summary Table ===\n")
+summary_df <- build_cross_network_summary(all_results)
+print(summary_df)
+
+timing_df <- data.frame(
+  Network = sapply(all_results, function(x) x$graph_name),
+  N_nodes = sapply(all_results, function(x) x$n_nodes),
+  N_edges = sapply(all_results, function(x) x$n_edges),
+  Mode = sapply(all_results, function(x) x$results[[1]]$Mode),
+  N_samples_or_states = sapply(all_results, function(x) x$results[[1]]$N),
+  Network_total_sec = sapply(all_results, function(x) round(x$network_total_sec, 4)),
+  row.names = NULL
+)
+
+print(timing_df)
+write.csv(timing_df, "cross_network_timing.csv", row.names = FALSE)
+
+
+write.csv(summary_df, "cross_network_summary.csv", row.names = FALSE)
+cat("\nSaved: cross_network_summary.csv\n")
+
+hosoya_rows   <- list()
+pairwise_rows <- list()
+mpoly_rows    <- list()
+
+for (net in all_results) {
+  net_name <- net$graph_name
+  s <- net$s; t <- net$t
+
+  for (item in net$results) {
+    p <- item$p
+
+    # --- 1. Full Hosoya vector (global, all pairs) ---
+    for (k in seq_along(item$Exp_Hosoya_mean)) {
+      hosoya_rows[[length(hosoya_rows) + 1]] <- data.frame(
+        Network = net_name, s = s, t = t, p = p, k = k,
+        E_dk_mean = item$Exp_Hosoya_mean[k],
+        E_dk_sd   = item$Exp_Hosoya_sd[k]
+      )
+    }
+
+   r_st <- item$R_st_mean
+    for (k in seq_along(item$Exp_Pairwise_st_mean)) {
+      uncond_mean <- item$Exp_Pairwise_st_mean[k]
+      uncond_sd   <- item$Exp_Pairwise_st_sd[k]
+      cond_mean   <- if (r_st > 0) uncond_mean / r_st else NA
+      pairwise_rows[[length(pairwise_rows) + 1]] <- data.frame(
+        Network = net_name, s = s, t = t, p = p, k = k,
+        Unconditional_mean = uncond_mean,
+        Unconditional_sd   = uncond_sd,
+        Conditional_mean   = cond_mean   # given connected; NA if R_st == 0
+      )
+    }
+
+    # --- 3. Top-10 M_G coefficients ---
+    ord <- order(-item$Exp_M_Poly_mean)[1:min(10, length(item$Exp_M_Poly_mean))]
+    for (idx in ord) {
+      mpoly_rows[[length(mpoly_rows) + 1]] <- data.frame(
+        Network = net_name, s = s, t = t, p = p,
+        Term = names(item$Exp_M_Poly_mean)[idx],
+        Mean = item$Exp_M_Poly_mean[idx],
+        SD   = item$Exp_M_Poly_sd[idx]
+      )
+    }
+  }
+}
+
+hosoya_df   <- do.call(rbind, hosoya_rows)
+pairwise_df <- do.call(rbind, pairwise_rows)
+mpoly_df    <- do.call(rbind, mpoly_rows)
+
+write.csv(hosoya_df,   "cross_network_hosoya.csv",   row.names = FALSE)
+write.csv(pairwise_df, "cross_network_pairwise.csv", row.names = FALSE)
+write.csv(mpoly_df,    "cross_network_mpoly_top10.csv", row.names = FALSE)
+
+cat("Saved: cross_network_hosoya.csv, cross_network_pairwise.csv, cross_network_mpoly_top10.csv\n")
+
+for (net in all_results) {
+  g_name <- net$graph_name
+  # Re-derive graph object is not stored in all_results; if you still have
+  # `suite` in your session, this loop verifies directly:
+  if (exists("suite") && g_name %in% names(suite)) {
+    cat(sprintf("  %-20s connected = %s\n", g_name, is_connected(suite[[g_name]])))
+  }
+}
+
+all_results_base <-all_results
+
+

@@ -1,0 +1,276 @@
+# turning_point_analysis.R
+#
+# Turning-point detection with per-candidate significance testing, comparing
+# Benjamini-Hochberg FDR control against Bonferroni family-wise error control,
+# applied to E[d(.,k)] vs. p sequences.
+
+csv_path    <-  "cross_network_hosoya_all_p.csv"#"cross_network_hosoya.csv"
+N           <-  2000
+alpha_level <-  0.05
+outdir      <-  "."
+plot_network <-  "Zachary"
+n_nonmono    <-   4
+n_mono       <-  4
+
+csv_path    
+N           
+alpha_level 
+outdir      
+plot_network 
+n_nonmono    
+n_mono       
+
+dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+
+cat(sprintf("Reading %s (N = %d draws per point, alpha level = %.3f)\n",
+            csv_path, N, alpha_level))
+
+df <- read_csv(csv_path, show_col_types = FALSE)
+
+required_cols <- c("Network", "p", "k", "E_dk_mean", "E_dk_sd")
+missing_cols <- setdiff(required_cols, names(df))
+if (length(missing_cols) > 0) {
+  stop("Input CSV is missing required column(s): ",
+       paste(missing_cols, collapse = ", "))
+}
+
+find_candidates <- function(sub) {
+  empty_result <- tibble(
+    p_mid = double(), pattern = character(),
+    p_lo = double(), p_hi = double(), m_lo = double(), m_mid = double(),
+    m_hi = double(), z = double(), pval = double()
+  )
+  sub <- sub %>% arrange(p)
+  n <- nrow(sub)
+  if (n < 3) return(empty_result)                    # need at least 3 points
+  if (all(sub$E_dk_mean == 0)) return(empty_result)  # no mass at this k anywhere
+
+  out <- list()
+  for (i in 2:(n - 1)) {
+    m_lo <- sub$E_dk_mean[i - 1]; m_mid <- sub$E_dk_mean[i]; m_hi <- sub$E_dk_mean[i + 1]
+    se_lo <- sub$E_dk_sd[i - 1] / sqrt(N)
+    se_mid <- sub$E_dk_sd[i]     / sqrt(N)
+    se_hi <- sub$E_dk_sd[i + 1] / sqrt(N)
+
+    pattern <- NA_character_
+    if (m_mid > m_lo && m_mid > m_hi) pattern <- "peak"
+    if (m_mid < m_lo && m_mid < m_hi) pattern <- "valley"
+    if (is.na(pattern)) next                # monotonic at this interior point
+
+    if (pattern == "peak") {
+      margin_lo <- m_mid - m_lo; margin_hi <- m_mid - m_hi
+    } else {
+      margin_lo <- m_lo - m_mid; margin_hi <- m_hi - m_mid
+    }
+    se_diff_lo <- sqrt(se_mid^2 + se_lo^2)
+    se_diff_hi <- sqrt(se_mid^2 + se_hi^2)
+    z_lo <- if (se_diff_lo > 0) margin_lo / se_diff_lo else Inf
+    z_hi <- if (se_diff_hi > 0) margin_hi / se_diff_hi else Inf
+    z <- min(z_lo, z_hi)                     # weakest-link margin
+    pval <- 1 - pnorm(z)                     # one-sided: is the margin > 0?
+
+    out[[length(out) + 1]] <- tibble(
+      p_mid = sub$p[i], pattern = pattern,
+      p_lo = sub$p[i - 1], p_hi = sub$p[i + 1],
+      m_lo = m_lo, m_mid = m_mid, m_hi = m_hi, z = z, pval = pval
+    )
+  }
+  if (length(out) == 0) return(empty_result)
+  bind_rows(out)
+}
+
+tests <- df %>%
+  group_by(Network, k) %>%
+  group_modify(~ find_candidates(.x)) %>%
+  ungroup()
+
+cat(sprintf("Candidate turning points found: %d\n", nrow(tests)))
+
+if (nrow(tests) == 0) {
+  stop("No candidate turning points found -- check input data (need >=3 p-values per (Network,k)).")
+}
+
+# ---------------------------------------------------------------------------
+# 3. Apply BOTH corrections to the same set of raw p-values
+
+tests <- tests %>%
+  mutate(
+    qval_BH          = p.adjust(pval, method = "BH"),
+    pval_bonferroni  = p.adjust(pval, method = "bonferroni"),
+    sig_BH           = qval_BH <= alpha_level,
+    sig_bonferroni   = pval_bonferroni <= alpha_level
+  ) %>%
+  arrange(pval)
+
+n_bh    <- sum(tests$sig_BH)
+n_bonf  <- sum(tests$sig_bonferroni)
+
+cat(sprintf("\nCandidates tested: %d\n", nrow(tests)))
+cat(sprintf("Significant under Benjamini-Hochberg (FDR <= %.0f%%):   %d\n", alpha_level * 100, n_bh))
+cat(sprintf("Significant under Bonferroni (FWER <= %.0f%%):          %d\n", alpha_level * 100, n_bonf))
+cat(sprintf("Bonferroni threshold for raw p-value: alpha/m = %.6f\n", alpha_level / nrow(tests)))
+cat(sprintf("Candidates significant under BH but NOT Bonferroni: %d\n", sum(tests$sig_BH & !tests$sig_bonferroni)))
+cat(sprintf("Candidates significant under Bonferroni but NOT BH: %d  (should always be 0: Bonferroni implies BH)\n",
+            sum(tests$sig_bonferroni & !tests$sig_BH)))
+
+sig <- tests %>% filter(sig_BH) %>% arrange(Network, k)
+
+collapse_ranges <- function(ks) {
+  ks <- sort(unique(ks))
+  if (length(ks) == 0) return("none")
+  breaks <- c(0, which(diff(ks) != 1), length(ks))
+  ranges <- character(0)
+  for (i in seq_len(length(breaks) - 1)) {
+    seg <- ks[(breaks[i] + 1):breaks[i + 1]]
+    ranges <- c(ranges, if (length(seg) == 1) as.character(seg)
+                else paste0(seg[1], "-", seg[length(seg)]))
+  }
+  paste(ranges, collapse = ", ")
+}
+
+summary_tbl <- tests %>%
+  group_by(Network) %>%
+  summarise(
+    n_sig_BH = sum(sig_BH),
+    k_ranges_BH = collapse_ranges(k[sig_BH]),
+    n_sig_bonferroni = sum(sig_bonferroni),
+    k_ranges_bonferroni = collapse_ranges(k[sig_bonferroni]),
+    .groups = "drop"
+  )
+
+
+all_networks <- tibble(Network = unique(df$Network))
+summary_tbl <- all_networks %>%
+  left_join(summary_tbl, by = "Network") %>%
+  mutate(
+    n_sig_BH = replace_na(n_sig_BH, 0),
+    k_ranges_BH = replace_na(k_ranges_BH, "none (monotonic)"),
+    n_sig_bonferroni = replace_na(n_sig_bonferroni, 0),
+    k_ranges_bonferroni = replace_na(k_ranges_bonferroni, "none (monotonic)")
+  )
+
+# ---------------------------------------------------------------------------
+# 5. Write outputs
+# ---------------------------------------------------------------------------
+write_csv(tests, file.path(outdir, "all_candidate_tests.csv"))
+write_csv(sig, file.path(outdir, "significant_results_BH.csv"))
+write_csv(summary_tbl, file.path(outdir, "summary_by_network.csv"))
+
+
+print(as.data.frame(summary_tbl), row.names = FALSE)
+
+
+
+# ---------------------------------------------------------------------------
+# 6. Example plot: for one network, 
+#    "Monotonic" here means the coefficient had NO candidate turning point
+#    at all in Step 1 
+
+library(ggplot2)
+
+  net_df <- df %>% filter(Network == plot_network) %>% arrange(k, p)
+
+  if (nrow(net_df) == 0) {
+    cat(sprintf("\nNetwork '%s' not found in input data -- skipping example plot.\n", plot_network))
+  } else {
+    # k's with at least one BH-significant candidate for this network
+    sig_ks <- tests %>%
+      filter(Network == plot_network, sig_BH) %>%
+      pull(k) %>% unique() %>% sort()
+
+    candidate_ks <- tests %>%
+      filter(Network == plot_network) %>%
+      pull(k) %>% unique()
+
+    nontrivial_ks <- net_df %>%
+      group_by(k) %>%
+      summarise(max_mean = max(E_dk_mean), .groups = "drop") %>%
+      filter(max_mean > 0.05) %>%
+      pull(k)
+
+    mono_ks_strict <- sort(setdiff(nontrivial_ks, candidate_ks))
+
+    nonsig_candidate_ks <- tests %>%
+      filter(Network == plot_network, !sig_BH) %>%
+      pull(k) %>% unique() %>% sort()
+    mono_ks_fallback <- sort(setdiff(intersect(nonsig_candidate_ks, nontrivial_ks), mono_ks_strict))
+
+    pick_spread <- function(ks, n) {
+      if (length(ks) == 0) return(integer(0))
+      if (length(ks) <= n) return(ks)
+      idx <- round(seq(1, length(ks), length.out = n))
+      ks[unique(idx)]
+    }
+
+    chosen_nonmono <- pick_spread(sig_ks, n_nonmono)
+    chosen_mono_strict <- pick_spread(mono_ks_strict, n_mono)
+    n_short <- n_mono - length(chosen_mono_strict)
+    chosen_mono_fallback <- if (n_short > 0) pick_spread(mono_ks_fallback, n_short) else integer(0)
+    chosen_mono <- c(chosen_mono_strict, chosen_mono_fallback)
+
+    if (n_short > 0 && length(chosen_mono_fallback) > 0) {
+      cat(sprintf("\nNote: '%s' has only %d coefficient(s) with zero raw candidate reversals and non-trivial mass;\n",
+                  plot_network, length(mono_ks_strict)))
+      cat(sprintf("  filled the remaining %d monotonic panel(s) with coefficients that had a raw candidate\n", length(chosen_mono_fallback)))
+      cat("  but were NOT significant under BH (labeled separately in the plot).\n")
+    } else if (n_short > 0) {
+      cat(sprintf("\nNote: only %d monotonic example(s) available for '%s' at all (requested %d).\n",
+                  length(chosen_mono), plot_network, n_mono))
+    }
+
+    if (length(chosen_nonmono) == 0 && length(chosen_mono) == 0) {
+      cat(sprintf("\nNo significant or clean-monotonic coefficients found for '%s' -- skipping example plot.\n",
+                  plot_network))
+    } else {
+      plot_df <- net_df %>%
+        filter(k %in% c(chosen_nonmono, chosen_mono)) %>%
+        mutate(
+          se = E_dk_sd / sqrt(N),
+          status = case_when(
+            k %in% chosen_nonmono ~ "Significant non-monotonic (BH)",
+            k %in% chosen_mono_strict ~ "Monotonic (no candidate reversal)",
+            TRUE ~ "Not significant (BH) -- candidate but rejected"
+          ),
+          facet_label = sprintf("k = %d  [%s]", k,
+                                 case_when(
+                                   k %in% chosen_nonmono ~ "non-monotonic",
+                                   k %in% chosen_mono_strict ~ "monotonic",
+                                   TRUE ~ "not significant"
+                                 ))
+        )
+
+      facet_order <- plot_df %>%
+        distinct(k, facet_label, status) %>%
+        arrange(status != "Significant non-monotonic (BH)", k) %>%
+        pull(facet_label)
+      plot_df$facet_label <- factor(plot_df$facet_label, levels = facet_order)
+
+      status_colors <- c("Significant non-monotonic (BH)" = "#D55E00",
+                          "Monotonic (no candidate reversal)" = "#0072B2",
+                          "Not significant (BH) -- candidate but rejected" = "#009E73")
+
+      p_plot <- ggplot(plot_df, aes(x = p, y = E_dk_mean, color = status)) +
+        geom_ribbon(aes(ymin = E_dk_mean - se, ymax = E_dk_mean + se, fill = status),
+                    alpha = 0.2, color = NA) +
+        geom_line(linewidth = 0.6) +
+        geom_point(size = 1.8) +
+        facet_wrap(~ facet_label, scales = "free_y", ncol = 4) +
+        scale_color_manual(values = status_colors) +
+        scale_fill_manual(values = status_colors) +
+        labs(
+          title = sprintf("%s: examples of BH-significant non-monotonic vs. monotonic coefficients", plot_network),
+          subtitle = "Ribbon = mean \u00b1 1 SE (N draws per point); shape is the raw evidence, color is the BH classification",
+          x = "Stress level p", y = "E[d = k]", color = NULL, fill = NULL
+        ) +
+        theme_minimal(base_size = 10) +
+        theme(legend.position = "bottom", legend.direction = "vertical",
+              strip.text = element_text(face = "bold"))
+
+      plot_file <- file.path(outdir, sprintf("example_behaviors_%s.png", plot_network))
+      ggsave(plot_file, p_plot, width = 12, height = 6.5, dpi = 150)
+      if (length(chosen_mono_fallback) > 0) {
+        cat(sprintf("  Monotonic k's shown (candidate, not BH-sig.):  %s\n", paste(chosen_mono_fallback, collapse = ", ")))
+      }
+    }
+  }
+}
